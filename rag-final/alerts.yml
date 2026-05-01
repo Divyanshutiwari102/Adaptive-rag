@@ -1,0 +1,255 @@
+---
+# alerts.yml — Prometheus Alert Rules for Adaptive RAG
+# FIX #10: Comprehensive alert coverage for all critical production scenarios.
+#
+# Mount this file in your Prometheus config:
+#   rule_files:
+#     - /etc/prometheus/alerts.yml
+#
+# Or add to prometheus.yml:
+#   rule_files:
+#     - alerts.yml
+
+groups:
+
+  # ── OpenAI / AI Service Alerts ─────────────────────────────────────────────
+  - name: openai_alerts
+    rules:
+
+      - alert: OpenAICircuitBreakerOpen
+        # FIX #10: Alert when the OpenAI circuit breaker trips open.
+        # This means >50% of OpenAI calls are failing. All RAG requests will
+        # serve fallback answers or 503s until the circuit half-opens (30s).
+        expr: |
+          resilience4j_circuitbreaker_state{name="openai", state="open"} == 1
+        for: 1m
+        labels:
+          severity: critical
+          team: backend
+        annotations:
+          summary: "OpenAI circuit breaker is OPEN"
+          description: >
+            The OpenAI circuit breaker has been open for > 1 minute.
+            All RAG pipeline requests are returning fallback answers.
+            Check OpenAI API status: https://status.openai.com
+            Instance: {{ $labels.instance }}
+
+      - alert: OpenAICircuitBreakerHalfOpen
+        expr: |
+          resilience4j_circuitbreaker_state{name="openai", state="half_open"} == 1
+        for: 0m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "OpenAI circuit breaker is half-open — recovery in progress"
+          description: >
+            The OpenAI circuit breaker is testing recovery.
+            3 probe requests will be allowed. Monitor for full recovery.
+
+      - alert: OpenAIHighErrorRate
+        expr: |
+          rate(rag_openai_errors_total[5m]) > 0.5
+        for: 3m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "High OpenAI error rate: {{ $value | humanize }}/s"
+          description: >
+            OpenAI API errors exceeding 0.5/s for 3+ minutes.
+            Method: {{ $labels.method }}. Circuit breaker may trip soon.
+
+      - alert: OpenAIHighLatency
+        expr: |
+          histogram_quantile(0.95,
+            rate(rag_openai_chat_latency_seconds_bucket[5m])
+          ) > 30
+        for: 5m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "OpenAI P95 latency > 30s"
+          description: >
+            P95 chat completion latency is {{ $value | humanizeDuration }}.
+            Users are experiencing slow responses. Check OpenAI rate limits.
+
+  # ── Cost Spike Alerts ──────────────────────────────────────────────────────
+  - name: cost_alerts
+    rules:
+
+      - alert: CostSpikeHigh
+        expr: |
+          rate(rag_openai_chat_cost_usd_total[10m]) > 0.01
+        for: 5m
+        labels:
+          severity: critical
+          team: backend
+        annotations:
+          summary: "Cost spike: {{ $value | humanize }} USD/s"
+          description: >
+            OpenAI spend rate is {{ $value }} USD/s, which projects to
+            approximately {{ $value }} * 3600 USD/hour.
+            Check for runaway users or prompt injection attacks.
+            Current per-user daily cap: {{ $labels.cap_usd }} USD.
+
+      - alert: CostSpikeWarning
+        expr: |
+          rate(rag_openai_chat_cost_usd_total[10m]) > 0.003
+        for: 10m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "Elevated cost rate: {{ $value | humanize }} USD/s"
+          description: >
+            OpenAI spend rate is elevated at {{ $value }} USD/s.
+            Monitor for continued growth.
+
+      - alert: EmbeddingCacheMissRateHigh
+        # High embed cost = cache not working. If cache hit rate drops, costs spike.
+        expr: |
+          rate(rag_openai_embed_cost_usd_total[10m]) > 0.002
+        for: 10m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "High embedding cost — cache may be down"
+          description: >
+            Embedding costs are elevated ({{ $value }} USD/s), suggesting
+            the Redis embedding cache may be unavailable. Check Redis health.
+
+  # ── Redis Alerts ───────────────────────────────────────────────────────────
+  - name: redis_alerts
+    rules:
+
+      - alert: RedisCacheFailuresHigh
+        # FIX #10 + FIX #4: Alert when the cache error handler is firing often.
+        # rag_rate_limit_redis_failures_total is the counter from RateLimiterService.
+        expr: |
+          rate(rag_rate_limit_redis_failures_total[5m]) > 0.1
+        for: 2m
+        labels:
+          severity: critical
+          team: infrastructure
+        annotations:
+          summary: "Redis unavailable — rate limiting and caching degraded"
+          description: >
+            Redis connection failures at {{ $value }}/s for > 2 minutes.
+            Rate limiting is DISABLED (fail-open). Embedding cache is BYPASSED.
+            OpenAI costs will increase significantly. Restore Redis immediately.
+
+      - alert: RedisConnectionPoolExhausted
+        expr: |
+          redis_connected_clients / redis_config_maxclients > 0.9
+        for: 5m
+        labels:
+          severity: warning
+          team: infrastructure
+        annotations:
+          summary: "Redis connection pool {{ $value | humanizePercentage }} full"
+          description: >
+            Redis is using {{ $value | humanizePercentage }} of max connections.
+            Increase maxclients or reduce pool sizes before connections are refused.
+
+  # ── Partition Health Alerts ────────────────────────────────────────────────
+  - name: partition_alerts
+    rules:
+
+      - alert: QueryHistoryPartitionMissing
+        # FIX #10 + FIX #8: Alert if future partitions haven't been created.
+        # query_history is partitioned monthly. If next month's partition is missing,
+        # INSERTs on the first day of next month will fail with:
+        #   "no partition of relation query_history found for row"
+        expr: |
+          (
+            count(
+              pg_stat_user_tables{relname=~"query_history_\\d{4}_\\d{2}"}
+            ) or vector(0)
+          )
+          < 2
+        for: 1h
+        labels:
+          severity: critical
+          team: backend
+        annotations:
+          summary: "query_history has fewer than 2 active partitions"
+          description: >
+            Expected at least 2 active monthly partitions (current + next month).
+            Found only {{ $value }} partitions. The PartitionMaintenanceService
+            scheduled job may have failed. Check application logs.
+            Manual fix: run PartitionMaintenanceService.ensureFuturePartitions().
+
+      - alert: PartitionMaintenanceJobFailed
+        # Alert if the maintenance job hasn't logged success recently
+        expr: |
+          time() - rag_partition_maintenance_last_success_timestamp > 86400
+        for: 0m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "Partition maintenance job has not run in 24h"
+          description: >
+            The daily partition maintenance job hasn't succeeded in over 24 hours.
+            Future partitions may not be created, risking INSERT failures.
+
+  # ── Pipeline Health Alerts ─────────────────────────────────────────────────
+  - name: pipeline_alerts
+    rules:
+
+      - alert: RAGFallbackRateHigh
+        # High fallback rate means retrieval is failing repeatedly — bad for users.
+        expr: |
+          rate(rag_pipeline_fallback_total[10m])
+          /
+          rate(rag_pipeline_requests_total{route="INDEX"}[10m])
+          > 0.3
+        for: 10m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "RAG fallback rate > 30%"
+          description: >
+            {{ $value | humanizePercentage }} of indexed-route requests are serving
+            fallback answers. Retrieval quality has degraded. Check:
+            1. Document ingestion status (are embeddings being created?)
+            2. Similarity threshold (rag.similarity-threshold)
+            3. pgvector index health
+
+      - alert: IngestionFailureRateHigh
+        expr: |
+          rate(rag_ingestion_total{status="FAILED"}[30m])
+          /
+          rate(rag_ingestion_total[30m])
+          > 0.2
+        for: 15m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "High document ingestion failure rate: {{ $value | humanizePercentage }}"
+          description: >
+            More than 20% of document ingestions are failing.
+            Check OpenAI embedding API status and S3/storage connectivity.
+
+      - alert: P99LatencyHigh
+        expr: |
+          histogram_quantile(0.99,
+            rate(rag_pipeline_latency_seconds_bucket{route="INDEX"}[5m])
+          ) > 20
+        for: 5m
+        labels:
+          severity: warning
+          team: backend
+        annotations:
+          summary: "RAG P99 latency > 20s on INDEX route"
+          description: >
+            1% of indexed RAG requests are taking > 20 seconds.
+            P99 = {{ $value | humanizeDuration }}. Check:
+            1. OpenAI API latency (especially cross-encoder calls)
+            2. pgvector query performance
+            3. HyDE generation latency

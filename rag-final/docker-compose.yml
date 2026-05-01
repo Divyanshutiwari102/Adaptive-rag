@@ -1,0 +1,247 @@
+version: "3.9"
+
+# ── Adaptive RAG — Free Stack (Groq + Ollama) ─────────────────────────────────
+#
+# BEFORE RUNNING:
+#   1. Install Ollama on your LOCAL machine (NOT in Docker):
+#      macOS:  brew install ollama
+#      Linux:  curl -fsSL https://ollama.com/install.sh | sh
+#
+#   2. Pull the embedding model (run ONCE):
+#      ollama pull nomic-embed-large
+#
+#   3. Start Ollama (keep this terminal open):
+#      ollama serve
+#      → Ollama runs at http://localhost:11434
+#
+#   4. Get a FREE Groq API key at https://console.groq.com (no credit card)
+#
+#   5. Fill in .env file (see .env)
+#
+#   6. Start core services:
+#      docker compose up -d
+#
+#   7. (Optional) Start monitoring:
+#      docker compose --profile monitoring up -d
+#
+# WHY Ollama runs outside Docker:
+#   Ollama needs access to GPU (if available) or maximum CPU resources.
+#   Running it in Docker adds overhead and complicates GPU passthrough.
+#   The app container reaches Ollama via host.docker.internal (macOS/Windows)
+#   or your host IP (Linux). This is configured via OLLAMA_HOST env var.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── PostgreSQL (pgvector) ──────────────────────────────────────────────────
+  postgres:
+    image: ankane/pgvector:latest
+    container_name: rag-postgres
+    environment:
+      POSTGRES_DB:       adaptive_rag
+      POSTGRES_USER:     ${DB_USERNAME:-raguser}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-ragpassword}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-raguser} -d adaptive_rag"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  # ── Redis ──────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: rag-redis
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:-redispassword}
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-redispassword}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  # ── Application ────────────────────────────────────────────────────────────
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag-app
+    ports:
+      - "8080:8080"
+    environment:
+      # Database
+      DB_HOST:         postgres
+      DB_PORT:         5432
+      DB_NAME:         adaptive_rag
+      DB_USERNAME:     ${DB_USERNAME:-raguser}
+      DB_PASSWORD:     ${DB_PASSWORD:-ragpassword}
+      # Redis
+      REDIS_HOST:      redis
+      REDIS_PORT:      6379
+      REDIS_PASSWORD:  ${REDIS_PASSWORD:-redispassword}
+      # Auth
+      JWT_SECRET:      ${JWT_SECRET}
+      # Groq API key (free — from console.groq.com)
+      # Variable is still named OPENAI_API_KEY to avoid code changes
+      OPENAI_API_KEY:  ${OPENAI_API_KEY}
+      # AWS (use test values for local dev — real S3 only needed in production)
+      AWS_ACCESS_KEY_ID:     ${AWS_ACCESS_KEY_ID:-test}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-test}
+      S3_BUCKET:             ${S3_BUCKET:-adaptive-rag-files}
+      AWS_REGION:            ${AWS_REGION:-us-east-1}
+      S3_ENDPOINT_OVERRIDE:  ${S3_ENDPOINT_OVERRIDE:-}
+      # Tracing
+      OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://jaeger:4318/v1/traces}
+
+      # ── Ollama host configuration ─────────────────────────────────────────
+      # The app container needs to reach Ollama running on your HOST machine.
+      #
+      # macOS / Windows (Docker Desktop):
+      #   host.docker.internal resolves to your host machine automatically.
+      #   OLLAMA_HOST=http://host.docker.internal:11434
+      #
+      # Linux:
+      #   host.docker.internal doesn't exist by default.
+      #   Use your host's IP on the docker0 bridge (usually 172.17.0.1):
+      #   OLLAMA_HOST=http://172.17.0.1:11434
+      #   Or find it with: ip route | grep docker0 | awk '{print $9}'
+      #
+      # We pass OLLAMA_HOST as an env var and override ollama.base-url in Spring:
+      SPRING_APPLICATION_JSON: >
+        {
+          "ollama": {
+            "base-url": "${OLLAMA_HOST:-http://host.docker.internal:11434}/v1"
+          }
+        }
+
+    extra_hosts:
+      # Required for Linux — allows host.docker.internal to resolve
+      - "host.docker.internal:host-gateway"
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
+    restart: unless-stopped
+
+  # ── Prometheus ────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: rag-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.enable-lifecycle'
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:9090/-/healthy || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    profiles:
+      - monitoring
+    restart: unless-stopped
+
+  # ── Alertmanager ──────────────────────────────────────────────────────────
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: rag-alertmanager
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    command:
+      - '--config.file=/etc/alertmanager/alertmanager.yml'
+      - '--storage.path=/alertmanager'
+    profiles:
+      - monitoring
+    restart: unless-stopped
+
+  # ── Grafana ───────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: rag-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER:     ${GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP:     "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    profiles:
+      - monitoring
+    restart: unless-stopped
+
+  # ── Jaeger ────────────────────────────────────────────────────────────────
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    container_name: rag-jaeger
+    ports:
+      - "16686:16686"
+      - "4318:4318"
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    profiles:
+      - monitoring
+    restart: unless-stopped
+
+  # ── LocalStack (S3 mock for local dev) ────────────────────────────────────
+  localstack:
+    image: localstack/localstack:3
+    container_name: rag-localstack
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES:       s3
+      DEFAULT_REGION: us-east-1
+    volumes:
+      - localstack_data:/var/lib/localstack
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    profiles:
+      - dev
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
+  prometheus_data:
+  alertmanager_data:
+  grafana_data:
+  localstack_data:

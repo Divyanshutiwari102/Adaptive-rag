@@ -1,0 +1,70 @@
+spring:
+  datasource:
+    url: jdbc:tc:postgresql:15:///adaptive_rag_test?TC_IMAGE_TAG=15-alpine
+    driver-class-name: org.testcontainers.jdbc.ContainerDatabaseDriver
+    username: test
+    password: test
+    hikari:
+      # FIX #3: Pre-declare GUC in test connections too
+      connection-init-sql: "SET app.current_user_id = ''"
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+  data:
+    redis:
+      host: localhost
+      port: 6370   # embedded Redis mock port; override in test setup
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: false
+
+  cache:
+    type: none   # disable Redis cache in unit tests
+
+openai:
+  api-key: test-key-not-real
+  base-url: http://localhost:8089   # WireMock
+  chat-model: gpt-4o
+  mini-model: gpt-4o-mini
+  embedding-model: text-embedding-3-small
+  embedding-dimensions: 1536
+  max-tokens: 100
+  temperature: 0.0
+  timeout-seconds: 5
+
+rag:
+  chunk-size: 200
+  chunk-overlap: 50
+  max-retrieval-results: 3
+  similarity-threshold: 0.0
+  max-context-tokens: 1000
+  ef-search: 10
+  hyde-enabled: false
+  cross-encoder-enabled: false
+  parallel-embed-pool-size: 2
+  enforce-spend-cap: false
+  daily-spend-cap-usd: 100.0
+
+jwt:
+  secret: dGVzdC1zZWNyZXQta2V5LWZvci10ZXN0aW5nLW9ubHktbm90LXJlYWw=
+  access-expiration-ms: 86400000
+  refresh-expiration-ms: 604800000
+
+rate-limit:
+  ask:
+    capacity: 1000
+    refill-tokens: 1000
+    refill-seconds: 60
+  ingest:
+    capacity: 100
+    refill-tokens: 100
+    refill-seconds: 60
+
+logging:
+  level:
+    com.ai.rag: DEBUG
+    org.flywaydb: WARN
