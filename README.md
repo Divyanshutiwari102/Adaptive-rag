@@ -320,7 +320,7 @@ Custom metrics exposed:
 ## Running Tests
 
 ```bash
-cd rag-final
+cd src
 mvn test
 ```
 
