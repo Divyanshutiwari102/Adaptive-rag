@@ -1,3 +1,20 @@
-# Project exclude paths
-/rag-final/target/
+# Project exclude path
 .env
+*.env
+*.env.*
+*.env.local
+
+# Ignore backend build output
+/Backend/target/
+/Backend/target/*
+
+# Ignore zip artifacts
+files*.zip
+
+# Frontend ignores
+/adaptive-rag-frontend/node_modules/
+/adaptive-rag-frontend/.next/
+/adaptive-rag-frontend/.turbo/
+/adaptive-rag-frontend/.vercel/
+/adaptive-rag-frontend/.env.local
+
