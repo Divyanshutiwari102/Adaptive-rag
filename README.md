@@ -347,6 +347,6 @@ Test coverage:
 ## Author
 
 **Divyanshu Tiwari**
-- GitHub: [github.com/divyanshutiwari](https://github.com/Divyanshutiwari102)
-- LinkedIn: [linkedin.com/in/divyanshutiwari]https://www.linkedin.com/in/divyanshu-tiwari-42b156289
+- GitHub: https://github.com/Divyanshutiwari102
+- LinkedIn: https://www.linkedin.com/in/divyanshu-tiwari-42b156289
 - Email: divyanshutiwari337@gmail.com
